@@ -4,7 +4,6 @@ import os
 import threading
 from pathlib import Path
 
-# Reduce CPU thread and memory pressure before importing TensorFlow.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
@@ -15,15 +14,15 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image
 
-
 BASE_DIR = Path(__file__).resolve().parent
-STAGE1_MODEL_PATH = BASE_DIR / "stage1_model.keras"
-STAGE2_MODEL_PATH = BASE_DIR / "stage2_model.keras"
+STAGE1_MODEL_PATH = BASE_DIR / "stage1_model.tflite"
+STAGE2_MODEL_PATH = BASE_DIR / "stage2_model.tflite"
+SETTINGS_PATH = BASE_DIR / "settings.json"
 
-print("Starting application...", flush=True)
+print("Starting TensorFlow Lite application...", flush=True)
 
-with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
-    settings = json.load(f)
+with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+    settings = json.load(file)
 
 IMG_SIZE = int(settings.get("IMG_SIZE", 380))
 STAGE1_THRESHOLD = float(settings.get("STAGE1_THRESHOLD", 0.38))
@@ -41,62 +40,117 @@ STAGE2_CLASS_NAMES = settings.get(
     ],
 )
 
-# Render's free service has limited RAM. The old version loaded both
-# EfficientNetB4 models together, which could make prediction hang for a long
-# time. A lock also prevents two users from loading models simultaneously.
 PREDICTION_LOCK = threading.Lock()
 
 
-def release_model(model):
-    """Release a Keras model and ask Python/TensorFlow to free memory."""
-    if model is not None:
-        del model
-    tf.keras.backend.clear_session()
-    gc.collect()
+def validate_files():
+    missing = [
+        path.name
+        for path in (STAGE1_MODEL_PATH, STAGE2_MODEL_PATH, SETTINGS_PATH)
+        if not path.exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required files: " + ", ".join(missing)
+        )
 
 
-def load_single_model(model_path: Path):
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file was not found: {model_path.name}")
-
-    print(f"Loading {model_path.name}...", flush=True)
-    model = tf.keras.models.load_model(model_path, compile=False)
-    print(f"Loaded {model_path.name} successfully.", flush=True)
-    return model
+validate_files()
+print("TensorFlow Lite model files found.", flush=True)
 
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     image = image.convert("RGB")
-    image = image.resize((IMG_SIZE, IMG_SIZE))
+    image = image.resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)
     image_array = np.asarray(image, dtype=np.float32)
     return np.expand_dims(image_array, axis=0)
 
 
-def run_model(model_path: Path, image_batch: np.ndarray) -> np.ndarray:
-    """Load one model, run inference, then release it before the next model."""
-    model = None
+def prepare_input(array: np.ndarray, input_detail: dict) -> np.ndarray:
+    dtype = input_detail["dtype"]
+
+    if np.issubdtype(dtype, np.floating):
+        return array.astype(dtype)
+
+    scale, zero_point = input_detail.get("quantization", (0.0, 0))
+    if scale and scale > 0:
+        converted = np.round(array / scale + zero_point)
+        limits = np.iinfo(dtype)
+        converted = np.clip(converted, limits.min, limits.max)
+        return converted.astype(dtype)
+
+    return array.astype(dtype)
+
+
+def prepare_output(array: np.ndarray, output_detail: dict) -> np.ndarray:
+    dtype = output_detail["dtype"]
+
+    if np.issubdtype(dtype, np.floating):
+        return array.astype(np.float32)
+
+    scale, zero_point = output_detail.get("quantization", (0.0, 0))
+    if scale and scale > 0:
+        return (array.astype(np.float32) - zero_point) * scale
+
+    return array.astype(np.float32)
+
+
+def run_tflite_model(model_path: Path, image_batch: np.ndarray) -> np.ndarray:
+    interpreter = None
+
     try:
-        model = load_single_model(model_path)
-        output = model(image_batch, training=False)
-        return np.asarray(output)
+        print(f"Loading {model_path.name}...", flush=True)
+
+        interpreter = tf.lite.Interpreter(
+            model_path=str(model_path),
+            num_threads=1,
+        )
+        interpreter.allocate_tensors()
+
+        input_detail = interpreter.get_input_details()[0]
+        output_detail = interpreter.get_output_details()[0]
+
+        expected_shape = tuple(int(value) for value in input_detail["shape"])
+        received_shape = tuple(image_batch.shape)
+
+        if expected_shape != received_shape:
+            raise ValueError(
+                f"Input shape mismatch for {model_path.name}. "
+                f"Expected {expected_shape}, received {received_shape}."
+            )
+
+        model_input = prepare_input(image_batch, input_detail)
+        interpreter.set_tensor(input_detail["index"], model_input)
+        interpreter.invoke()
+
+        raw_output = interpreter.get_tensor(output_detail["index"])
+        output = prepare_output(raw_output, output_detail)
+
+        print(f"Finished {model_path.name} inference.", flush=True)
+        return output
+
     finally:
-        release_model(model)
+        if interpreter is not None:
+            del interpreter
+        gc.collect()
 
 
 def predict_retinal_disease(image: Image.Image) -> str:
     if image is None:
         return "Please upload a retinal fundus image first."
 
-    # Only one prediction at a time. This protects the small Render instance
-    # from running out of memory when multiple visitors click Predict.
     with PREDICTION_LOCK:
         try:
             print("Prediction started.", flush=True)
-            x = preprocess_image(image)
+            image_batch = preprocess_image(image)
 
-            # Load and release Stage 1 before Stage 2 is loaded.
-            stage1_output = run_model(STAGE1_MODEL_PATH, x)
+            stage1_output = run_tflite_model(
+                STAGE1_MODEL_PATH,
+                image_batch,
+            )
+
             diseased_prob = float(np.ravel(stage1_output)[0])
+            diseased_prob = float(np.clip(diseased_prob, 0.0, 1.0))
             normal_prob = 1.0 - diseased_prob
 
             stage1_prediction = (
@@ -127,16 +181,19 @@ def predict_retinal_disease(image: Image.Image) -> str:
                     ]
                 )
             else:
-                # Stage 1 has already been removed from memory here.
-                stage2_output = run_model(STAGE2_MODEL_PATH, x)[0]
+                stage2_output = run_tflite_model(
+                    STAGE2_MODEL_PATH,
+                    image_batch,
+                )[0]
 
                 pred_id = int(np.argmax(stage2_output))
                 confidence = float(np.max(stage2_output))
 
-                if confidence < CONFIDENCE_THRESHOLD:
-                    final_prediction = "Unknown/Uncertain"
-                else:
-                    final_prediction = STAGE2_CLASS_NAMES[pred_id]
+                final_prediction = (
+                    "Unknown/Uncertain"
+                    if confidence < CONFIDENCE_THRESHOLD
+                    else STAGE2_CLASS_NAMES[pred_id]
+                )
 
                 top_n = min(3, len(STAGE2_CLASS_NAMES))
                 top_indices = np.argsort(stage2_output)[-top_n:][::-1]
@@ -156,10 +213,9 @@ def predict_retinal_disease(image: Image.Image) -> str:
 
                 for rank, idx in enumerate(top_indices, start=1):
                     idx = int(idx)
-                    probability = float(stage2_output[idx])
                     lines.append(
                         f"{rank}. {STAGE2_CLASS_NAMES[idx]}: "
-                        f"{probability:.4f}"
+                        f"{float(stage2_output[idx]):.4f}"
                     )
 
             lines.extend(
@@ -173,12 +229,14 @@ def predict_retinal_disease(image: Image.Image) -> str:
                 ]
             )
 
-            print("Prediction completed.", flush=True)
+            print("Prediction completed successfully.", flush=True)
             return "\n".join(lines)
 
         except Exception as error:
-            print(f"Prediction error: {type(error).__name__}: {error}", flush=True)
-            tf.keras.backend.clear_session()
+            print(
+                f"Prediction error: {type(error).__name__}: {error}",
+                flush=True,
+            )
             gc.collect()
             return (
                 "An error occurred while processing the image.\n\n"
@@ -196,8 +254,7 @@ Upload a retinal fundus image.
 **Stage 1:** Normal vs Diseased  
 **Stage 2:** Disease group classification
 
-The first prediction after the service wakes up may take a few minutes because
-Render must download and load the trained models.
+This application uses optimized TensorFlow Lite models.
 
 This application is for research and screening demonstration only.
 """

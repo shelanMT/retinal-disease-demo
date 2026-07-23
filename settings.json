@@ -1,0 +1,31 @@
+{
+    "IMG_SIZE": 380,
+    "STAGE1_THRESHOLD": 0.38,
+    "CONFIDENCE_THRESHOLD": 0.75,
+    "stage1_class_names": [
+        "Normal",
+        "Diseased"
+    ],
+    "stage2_class_names": [
+        "AMD",
+        "Cataract",
+        "Diabetic Retinopathy",
+        "Glaucoma",
+        "Hypertensive Retinopathy",
+        "Pathological Myopia"
+    ],
+    "stage2_label_map": {
+        "AMD": 0,
+        "Cataract": 1,
+        "Diabetic Retinopathy": 2,
+        "Glaucoma": 3,
+        "Hypertensive Retinopathy": 4,
+        "Pathological Myopia": 5
+    },
+    "version": "final_improved_stage1_stage2",
+    "stage1_final_external_accuracy": 0.8506437768240344,
+    "stage1_final_external_diseased_recall": 0.89,
+    "stage1_final_threshold": 0.38,
+    "stage1_note": "Stage 1 improved using external-style fine-tuning and threshold tuning. Final threshold selected as 0.38.",
+    "stage2_note": "Stage 2 improved for glaucoma using external fine-tuning."
+}
